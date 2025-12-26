@@ -19,6 +19,7 @@ from orbax import checkpoint as ocp
 import jax
 
 from playground.common.export_onnx import export_onnx
+from playground.common.export_jax_to_onnx import export_onnx_jax
 
 
 class BaseRunner(ABC):
@@ -41,6 +42,7 @@ class BaseRunner(ABC):
         self.obs_size = None
         self.num_timesteps = args.num_timesteps
         self.restore_checkpoint_path = None
+        self.use_jax_to_onnx = getattr(args, 'use_jax_to_onnx', False)
         
         # CACHE STUFF
         os.makedirs(".tmp", exist_ok=True)
@@ -65,23 +67,52 @@ class BaseRunner(ABC):
         )
         print("-----------")
 
-    def policy_params_fn(self, current_step, make_policy, params):
-        # save checkpoints
+    def _export_onnx_model(self, params, output_path: str) -> None:
+        """Export policy to ONNX format.
+        
+        Args:
+            params: Policy parameters containing normalization stats and model weights.
+            output_path: Path to save the ONNX model file.
+        """
+        if self.use_jax_to_onnx:
+            print("Using JAX-to-ONNX direct export")
+            export_onnx_jax(
+                params,
+                self.action_size,
+                self.ppo_params,
+                self.obs_size,
+                output_path=output_path
+            )
+        else:
+            print("Using TensorFlow-based ONNX export")
+            export_onnx(
+                params,
+                self.action_size,
+                self.ppo_params,
+                self.obs_size,
+                output_path=output_path
+            )
 
+    def policy_params_fn(self, current_step, make_policy, params):
+        """Save checkpoint and export ONNX model.
+        
+        This callback is invoked during training to save checkpoints
+        and export the policy to ONNX format for inference.
+        """
         orbax_checkpointer = ocp.PyTreeCheckpointer()
         save_args = orbax_utils.save_args_from_target(params)
         d = datetime.now().strftime("%Y_%m_%d_%H%M%S")
         path = f"{self.output_dir}/{d}_{current_step}"
         print(f"Saving checkpoint (step: {current_step}): {path}")
         orbax_checkpointer.save(path, params, force=True, save_args=save_args)
+        
         onnx_export_path = f"{self.output_dir}/{d}_{current_step}.onnx"
-        export_onnx(
-            params,
-            self.action_size,
-            self.ppo_params,
-            self.obs_size,  # may not work
-            output_path=onnx_export_path
-        )
+        try:
+            self._export_onnx_model(params, onnx_export_path)
+            print(f"ONNX model exported to: {onnx_export_path}")
+        except Exception as e:
+            print(f"Warning: Failed to export ONNX model: {e}")
+            print("Training will continue, but ONNX export was skipped.")
 
     def train(self) -> None:
         self.ppo_params = locomotion_params.brax_ppo_config(

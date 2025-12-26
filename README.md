@@ -97,6 +97,19 @@ Inspired from https://github.com/kscalelabs/mujoco_playground
 uv run playground/open_duck_mini_v2/runner.py --task flat_terrain_backlash --num_timesteps 300000000
 ```
 
+### ONNX Export Options
+
+By default, the runner uses TensorFlow-based ONNX export. For newer GPUs (e.g., RTX 5090) or to avoid TensorFlow dependencies, use the direct JAX-to-ONNX export:
+
+```bash
+uv run playground/open_duck_mini_v2/runner.py --task flat_terrain_backlash --num_timesteps 300000000 --use_jax_to_onnx
+```
+
+The `--use_jax_to_onnx` flag enables direct JAX-to-ONNX conversion, which:
+- Avoids TensorFlow dependency
+- Resolves CUDA compatibility issues on newer GPUs
+- Uses the same ONNX output format (opset 11, compatible with Isaac Lab)
+
 
 ## Dependencies
 

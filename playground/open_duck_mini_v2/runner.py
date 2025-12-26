@@ -50,6 +50,11 @@ def main() -> None:
         default=None,
         help="Resume training from this checkpoint",
     )
+    parser.add_argument(
+        "--use_jax_to_onnx",
+        action="store_true",
+        help="Use JAX-to-ONNX direct export (avoids TensorFlow, better for RTX 5090)",
+    )
     # parser.add_argument(
     #     "--debug", action="store_true", help="Run in debug mode with minimal parameters"
     # )
