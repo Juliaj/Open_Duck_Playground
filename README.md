@@ -96,3 +96,50 @@ Inspired from https://github.com/kscalelabs/mujoco_playground
 ```bash
 uv run playground/open_duck_mini_v2/runner.py --task flat_terrain_backlash --num_timesteps 300000000
 ```
+
+
+## Dependencies
+
+Sync dependencies:
+
+```bash
+uv sync
+```
+
+### Updating Dependencies with Nightly Builds
+
+This project uses PyTorch nightly builds for RTX 5090 support. To update PyTorch packages or add new dependencies that require the nightly index:
+
+```bash
+uv lock --upgrade-package torch --upgrade-package torchvision --upgrade-package torchaudio --extra-index-url https://download.pytorch.org/whl/nightly/cu128 --index-strategy unsafe-best-match
+uv sync
+```
+
+The `--index-strategy unsafe-best-match` flag allows uv to check all indexes (PyPI and PyTorch nightly) to find the best matching versions. This is needed because some packages may only be available on PyPI while PyTorch nightly builds are on a separate index.
+
+To add a new package that requires the nightly index:
+
+```bash
+uv lock --upgrade-package <package_name> --extra-index-url https://download.pytorch.org/whl/nightly/cu128 --index-strategy unsafe-best-match
+uv sync
+```
+
+## Running Tests
+
+Run all unit tests:
+
+```bash
+uv run python -m unittest discover tests
+```
+
+Run a specific test file:
+
+```bash
+uv run python -m unittest tests.test_export_onnx_jax
+```
+
+Run with verbose output:
+
+```bash
+uv run python -m unittest tests.test_export_onnx_jax -v
+```
