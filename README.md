@@ -110,6 +110,87 @@ The `--use_jax_to_onnx` flag enables direct JAX-to-ONNX conversion, which:
 - Resolves CUDA compatibility issues on newer GPUs
 - Uses the same ONNX output format (opset 11, compatible with Isaac Lab)
 
+## Model Validation
+
+During training, ONNX models are automatically exported with metadata (`.metadata.json` files). Use the validation scripts to verify model quality before deployment.
+
+### Step 1: Numerical Validation
+
+Validate that ONNX output matches JAX inference (numerical correctness):
+
+```bash
+# Validate single model
+uv run python tests/validate_onnx_numerical.py --onnx checkpoints/model.onnx
+
+# Validate all models
+uv run python tests/validate_onnx_numerical.py --checkpoints-dir checkpoints
+```
+
+This checks:
+- Mean Absolute Error (MAE) < 1e-4
+- Mean Squared Error (MSE) < 1e-8
+- Max per-element error < 1e-3
+
+### Step 2: Simulation Validation
+
+Test models in MuJoCo simulation to verify they work in practice:
+
+```bash
+# Test single model (default: 2 minutes)
+uv run python tests/validate_onnx_simulation.py --onnx checkpoints/model.onnx
+
+# Test with custom duration
+uv run python tests/validate_onnx_simulation.py --onnx checkpoints/model.onnx --duration 60
+
+# Test with viewer for visual inspection
+uv run python tests/validate_onnx_simulation.py --onnx checkpoints/model.onnx --viewer
+
+# Test with custom fall detection parameters
+uv run python tests/validate_onnx_simulation.py --onnx checkpoints/model.onnx --viewer --fall-height-threshold 0.3 --fall-duration-steps 5000
+
+# Test all models
+uv run python tests/validate_onnx_simulation.py --checkpoints-dir checkpoints
+```
+
+**Compare JAX vs ONNX behavior:**
+```bash
+# Test JAX model with viewer
+uv run python tests/validate_jax_simulation.py --checkpoint checkpoints/checkpoint_dir --viewer
+
+# Test ONNX model with viewer (same checkpoint)
+uv run python tests/validate_onnx_simulation.py --onnx checkpoints/model.onnx --viewer
+```
+
+This tests:
+- Forward walk command execution
+- Fall detection (body height monitoring)
+- Stability score and forward distance metrics
+
+### Generate Metadata for Existing Models
+
+If you have ONNX models without metadata, generate it:
+
+```bash
+# Single model
+uv run python tests/generate_metadata_for_existing.py --onnx checkpoints/model.onnx --reward 299.24 --reward-std 172.74
+
+# All models in directory
+uv run python tests/generate_metadata_for_existing.py --checkpoints-dir checkpoints
+```
+
+### Convert to Hugging Face Format
+
+Convert metadata to Hugging Face format for publishing:
+
+```bash
+# Single model
+uv run python playground/common/convert_metadata_to_hf.py --onnx checkpoints/model.onnx
+
+# All models in directory
+uv run python playground/common/convert_metadata_to_hf.py --checkpoints-dir checkpoints
+```
+
+This creates `config.json` and `README.md` files compatible with Hugging Face Model Hub.
 
 ## Dependencies
 

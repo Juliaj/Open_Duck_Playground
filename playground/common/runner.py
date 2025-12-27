@@ -101,6 +101,10 @@ class BaseRunner(ABC):
             f'STEP: {num_steps} reward: {metrics["eval/episode_reward"]} reward_std: {metrics["eval/episode_reward_std"]}'
         )
         print("-----------")
+        
+        # Store latest metrics for metadata
+        self.latest_reward = float(metrics["eval/episode_reward"])
+        self.latest_reward_std = float(metrics["eval/episode_reward_std"])
 
     def _export_onnx_model(self, params, output_path: str) -> None:
         """Export policy to ONNX format.
@@ -130,7 +134,11 @@ class BaseRunner(ABC):
                 self.action_size,
                 self.ppo_params,
                 self.obs_size,
-                output_path=output_path
+                output_path=output_path,
+                checkpoint_path=None,  # Will be set in policy_params_fn
+                training_step=None,  # Will be set in policy_params_fn
+                reward=None,  # Will be set in policy_params_fn
+                reward_std=None  # Will be set in policy_params_fn
             )
         else:
             print("Using TensorFlow-based ONNX export")
@@ -158,7 +166,23 @@ class BaseRunner(ABC):
         
         onnx_export_path = f"{self.output_dir}/{d}_{current_step}.onnx"
         try:
-            self._export_onnx_model(params, onnx_export_path)
+            if self.use_jax_to_onnx:
+                # JAX export with metadata
+                from playground.common.export_jax_to_onnx import export_onnx_jax
+                export_onnx_jax(
+                    params,
+                    self.action_size,
+                    self.ppo_params,
+                    self.obs_size,
+                    output_path=onnx_export_path,
+                    checkpoint_path=path,
+                    training_step=current_step,
+                    reward=getattr(self, 'latest_reward', None),
+                    reward_std=getattr(self, 'latest_reward_std', None)
+                )
+            else:
+                # TensorFlow export (no metadata support yet)
+                self._export_onnx_model(params, onnx_export_path)
             print(f"ONNX model exported to: {onnx_export_path}")
         except Exception as e:
             print(f"Warning: Failed to export ONNX model: {e}")

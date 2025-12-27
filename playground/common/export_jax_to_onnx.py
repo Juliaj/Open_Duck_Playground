@@ -19,6 +19,9 @@ import inspect
 from typing import Callable
 import os
 import warnings
+import json
+import numpy as np
+from datetime import datetime
 
 import jax
 import jax.numpy as jnp
@@ -28,7 +31,8 @@ from jax2onnx import to_onnx
 
 
 def export_onnx_jax(
-    params, act_size, ppo_params, obs_size, output_path="open_duck_mini_v2_jax.onnx"
+    params, act_size, ppo_params, obs_size, output_path="open_duck_mini_v2_jax.onnx",
+    checkpoint_path=None, training_step=None, reward=None, reward_std=None
 )->str:
     """
     Export JAX policy to ONNX format using jax2onnx (direct conversion).
@@ -189,6 +193,16 @@ def export_onnx_jax(
             f.write(model_proto.SerializeToString())
     except Exception as e:
         raise ValueError(f"Failed to save ONNX model: {e}") from e
+
+    # Generate and save metadata (always in local format)
+    try:
+        _save_metadata(
+            output_path, params, act_size, obs_size, ppo_params,
+            checkpoint_path, training_step, reward, reward_std
+        )
+    except Exception as e:
+        print(f"Warning: Failed to save metadata: {e}")
+        print("ONNX model was saved successfully, but metadata generation was skipped.")
 
     return output_path
 
@@ -599,3 +613,115 @@ def make_jax_inference_fn(params, act_size, ppo_params, obs_size) -> Callable:
         return jnp.tanh(loc)
         
     return jax_inference_fn
+
+
+def _generate_example_data(jax_inference_fn, obs_size, num_examples=5):
+    """Generate example observations and actions for metadata.
+    
+    Parameters:
+    -----------
+    jax_inference_fn : Callable
+        JAX inference function
+    obs_size : int
+        Observation size
+    num_examples : int
+        Number of examples to generate (default: 5)
+    
+    Returns:
+    --------
+    dict
+        Dictionary with 'example_observations' and 'example_actions' lists
+    """
+    examples = []
+    
+    # Generate different types of inputs
+    test_inputs = [
+        np.random.randn(1, obs_size).astype(np.float32),  # Random
+        np.zeros((1, obs_size), dtype=np.float32),  # Zero
+        np.ones((1, obs_size), dtype=np.float32),  # Unit
+        np.random.randn(1, obs_size).astype(np.float32) * 2.0,  # Large values
+        np.random.randn(1, obs_size).astype(np.float32) * 0.5,  # Small values
+    ]
+    
+    for i, test_input in enumerate(test_inputs[:num_examples]):
+        obs_jax = jnp.array(test_input)
+        action_jax = jax_inference_fn(obs_jax)
+        
+        examples.append({
+            "observation": test_input.tolist()[0],  # Remove batch dimension
+            "action": np.array(action_jax).tolist()[0]  # Remove batch dimension
+        })
+    
+    return examples
+
+
+def _save_metadata(
+    onnx_path, params, act_size, obs_size, ppo_params,
+    checkpoint_path, training_step, reward, reward_std
+):
+    """Save metadata for ONNX model in local format.
+    
+    Parameters:
+    -----------
+    onnx_path : str
+        Path to ONNX file
+    params : tuple
+        Policy parameters
+    act_size : int
+        Action size
+    obs_size : int
+        Observation size
+    ppo_params : object
+        PPO configuration
+    checkpoint_path : str, optional
+        Path to checkpoint directory
+    training_step : int, optional
+        Training step number
+    reward : float, optional
+        Training reward
+    reward_std : float, optional
+        Training reward std
+    """
+    # Extract normalization params
+    mean, std = extract_norm_params(params)
+    
+    # Generate example data
+    jax_inference_fn = make_jax_inference_fn(params, act_size, ppo_params, obs_size)
+    examples = _generate_example_data(jax_inference_fn, obs_size, num_examples=5)
+    
+    # Build metadata dict
+    metadata = {
+        "model_type": "ppo_policy",
+        "obs_size": int(obs_size),
+        "act_size": int(act_size),
+        "opset_version": 11,
+        "framework": "onnx",
+        "source_framework": "jax",
+        "conversion_tool": "jax2onnx",
+        "original_architecture": "brax_ppo",
+        "conversion_reason": "RTX 5090 CUDA compatibility",
+        "training_repo": "https://github.com/apirrone/Open_Duck_Playground",
+        "license": "apache-2.0",
+        "normalization": {
+            "mean": np.array(mean).tolist(),
+            "std": np.array(std).tolist()
+        },
+        "example_observations": [ex["observation"] for ex in examples],
+        "example_actions": [ex["action"] for ex in examples],
+        "export_timestamp": datetime.now().isoformat()
+    }
+    
+    if checkpoint_path:
+        metadata["checkpoint_path"] = str(checkpoint_path)
+    if training_step is not None:
+        metadata["training_step"] = int(training_step)
+    if reward is not None:
+        metadata["reward"] = float(reward)
+    if reward_std is not None:
+        metadata["reward_std"] = float(reward_std)
+    
+    # Save metadata in local format: {onnx}.metadata.json
+    metadata_path = f"{onnx_path}.metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
