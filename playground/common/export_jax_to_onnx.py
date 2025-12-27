@@ -18,7 +18,9 @@ import functools
 import inspect
 from typing import Callable
 import os
+import warnings
 
+import jax
 import jax.numpy as jnp
 # import RL policies from Brax. Brax is also a physics engine for RL but not used for this project.
 from brax.training.agents.ppo import networks as ppo_networks
@@ -33,6 +35,9 @@ def export_onnx_jax(
     
     This function directly converts JAX inference function to ONNX without
     going through TensorFlow, avoiding CUDA compatibility issues on new GPUs like the RTX 5090.
+    
+    Note: jax2onnx may fail with certain Flax network operations that use dynamic shapes
+    during tracing. If this occurs, consider using the TensorFlow-based export as a fallback.
     
     Parameters:
     -----------
@@ -67,20 +72,111 @@ def export_onnx_jax(
     
     print(" === Exporting to ONNX directly from JAX === ")
     
-    # Create JAX inference function with normalization and output processing
-    jax_inference_fn = make_jax_inference_fn(params, act_size, ppo_params, obs_size)
-    
-    # Convert to ONNX using jax2onnx
-    input_shapes = {"obs": (1, obs_size)}
-    try:
-        model_proto = to_onnx(
-            jax_inference_fn,
-            input_shapes=input_shapes,
-            opset=11,
-            output_names=["continuous_actions"]
+    # Suppress jax2onnx warnings about float64 truncation to float32
+    # jax2onnx internally uses float64 in some operations, but JAX defaults to float32.
+    # These warnings are excessive and don't affect functionality.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=".*Explicitly requested dtype float64.*",
+            category=UserWarning,
+            module="jax2onnx.*"
         )
-    except Exception as e:
-        raise ValueError(f"Failed to convert to ONNX: {e}") from e
+        
+        # Create JAX inference function with normalization and output processing
+        jax_inference_fn = make_jax_inference_fn(params, act_size, ppo_params, obs_size)
+        
+        # Pre-compile the function with JIT to ensure it's fully traceable
+        # This helps catch any tracing issues before jax2onnx tries to convert
+        # We warm up the function with a concrete input to ensure all shapes are resolved
+        input_spec = jax.ShapeDtypeStruct(shape=(1, obs_size), dtype=jnp.float32)
+        concrete_input = jnp.zeros((1, obs_size), dtype=jnp.float32)
+        
+        # Warm up the function to ensure it's fully compiled
+        try:
+            _ = jax_inference_fn(concrete_input)
+            # Also try JIT compilation to ensure traceability
+            jax_inference_fn_jit = jax.jit(jax_inference_fn)
+            _ = jax_inference_fn_jit(concrete_input)
+        except Exception as warmup_error:
+            raise ValueError(
+                f"Function warmup failed, cannot proceed with ONNX export: {warmup_error}"
+            ) from warmup_error
+        
+        # Convert to ONNX using jax2onnx
+        # Try with the original function first, then with JIT if needed
+        try:
+            model_proto = to_onnx(
+                jax_inference_fn,
+                inputs=[input_spec],
+                opset=11,
+                model_name="open_duck_policy"
+            )
+        except Exception as e:
+            error_msg = str(e)
+            # If tracing fails, try with JIT compiled version
+            if "JitTracer" in error_msg or "concrete value" in error_msg.lower():
+                print("Initial conversion failed, trying with JIT-compiled function...")
+                try:
+                    model_proto = to_onnx(
+                        jax_inference_fn_jit,
+                        inputs=[input_spec],
+                        opset=11,
+                        model_name="open_duck_policy"
+                    )
+                except Exception as e2:
+                    # If JIT version also fails, provide helpful error
+                    raise ValueError(
+                        f"Failed to convert to ONNX even with JIT compilation: {e2}\n"
+                        "This error typically occurs when jax2onnx encounters dynamic shapes "
+                        "in Flax network operations during tracing. The function executes correctly, "
+                        "but jax2onnx's tracing mechanism cannot handle certain Flax operations.\n"
+                        "Consider using the TensorFlow-based ONNX export as a fallback "
+                        "(disable --use_jax_to_onnx flag)."
+                    ) from e2
+            else:
+                raise ValueError(f"Failed to convert to ONNX: {e}") from e
+        
+        # Set input and output names on the ONNX model proto
+        # jax2onnx may generate generic names, so we set them explicitly
+        if len(model_proto.graph.input) > 0:
+            # Find the actual input name used in the graph nodes
+            old_input_name = model_proto.graph.input[0].name
+            actual_input_name = None
+            # Check what the first node(s) use as input
+            for node in model_proto.graph.node:
+                for inp in node.input:
+                    # If input is not from a previous node and not an initializer, it's the graph input
+                    if (inp not in [n_out for n in model_proto.graph.node for n_out in n.output] and
+                        inp not in [init.name for init in model_proto.graph.initializer]):
+                        actual_input_name = inp
+                        break
+                if actual_input_name:
+                    break
+            
+            # Use the actual input name found, or fall back to graph input name
+            input_name_to_replace = actual_input_name if actual_input_name else old_input_name
+            
+            # Rename the graph input
+            model_proto.graph.input[0].name = "obs"
+            # Update all node references to use "obs"
+            for node in model_proto.graph.node:
+                for i, inp in enumerate(node.input):
+                    if inp == input_name_to_replace:
+                        node.input[i] = "obs"
+        
+        if len(model_proto.graph.output) > 0:
+            # Get the actual output name from the last node
+            if len(model_proto.graph.node) > 0:
+                last_node = model_proto.graph.node[-1]
+                if len(last_node.output) > 0:
+                    actual_output_name = last_node.output[0]
+                    # Rename the last node's output to "continuous_actions"
+                    last_node.output[0] = "continuous_actions"
+                    # Update the graph output name
+                    model_proto.graph.output[0].name = "continuous_actions"
+            else:
+                model_proto.graph.output[0].name = "continuous_actions"
 
     # Save ONNX model
     # Create the directory if it doesn't exist before saving the model
@@ -102,8 +198,10 @@ def extract_norm_params(params) -> tuple[jnp.ndarray, jnp.ndarray]:
     
     Parameters:
     -----------
-    params : tuple
-        Policy parameters tuple of length 2: (normalization_params, model_params)
+    params : tuple or list
+        Policy parameters tuple/list of length 2 or 3: 
+        - (normalization_params, model_params) for length 2
+        - (normalization_params, policy_params, value_params) for length 3
     
     Returns:
     --------
@@ -113,21 +211,29 @@ def extract_norm_params(params) -> tuple[jnp.ndarray, jnp.ndarray]:
     Raises:
     ------
     ValueError
-        If params is not a tuple of length 2
+        If params has fewer than 2 elements
     TypeError
         If normalization parameters cannot be extracted
     """
-    if len(params) != 2:
-        raise ValueError(f"params must be a tuple of length 2, got {len(params)}")
+    if len(params) < 2:
+        raise ValueError(f"params must have at least 2 elements, got {len(params)}")
     
     norm_params = params[0]
     try:
-        mean: jnp.ndarray = norm_params.mean["state"]
-    except AttributeError as e:
+        # Handle both dict and object with attributes
+        if isinstance(norm_params, dict):
+            mean: jnp.ndarray = norm_params["mean"]["state"]
+        else:
+            mean: jnp.ndarray = norm_params.mean["state"]
+    except (AttributeError, KeyError, TypeError) as e:
         raise TypeError(f"Failed to extract mean parameters: {e}") from e
     try:
-        std: jnp.ndarray = norm_params.std["state"]
-    except AttributeError as e:
+        # Handle both dict and object with attributes
+        if isinstance(norm_params, dict):
+            std: jnp.ndarray = norm_params["std"]["state"]
+        else:
+            std: jnp.ndarray = norm_params.std["state"]
+    except (AttributeError, KeyError, TypeError) as e:
         raise TypeError(f"Failed to extract std parameters: {e}") from e
     return mean, std
 
@@ -138,45 +244,55 @@ def extract_model_params(model_params_obj) -> dict:
     
     Parameters:
     -----------
-    model_params_obj : dict or object
+    model_params_obj : dict
         Model parameters from params[1]. Can be either:
-        - A dictionary directly containing the parameters
-        - An object with a 'policy' attribute containing parameters
+        - A dictionary with nested 'params' containing raw network layers (e.g., {'params': {'hidden_0': ...}})
+        - A dictionary with PPO structure (policy, value, aux, etc.)
     
     Returns:
     --------
     dict
-        Validated model parameters dictionary
+        Model parameters dictionary with 'policy' key containing the policy network parameters
     
     Raises:
     ------
     TypeError
         If model_params_obj is neither a dict nor has expected attributes
     KeyError
-        If required keys are missing from model_params
+        If 'policy' key is missing from model_params
     """
-    try:
-        if isinstance(model_params_obj, dict):
-            model_params: dict = model_params_obj
+    # Handle dict input
+    if isinstance(model_params_obj, dict):
+        # Check for nested 'params' with raw network layers (e.g., {'params': {'hidden_0': ...}})
+        # This is the structure from Brax checkpoints: params[1] = {'params': {'hidden_0': ..., 'hidden_1': ...}}
+        if 'params' in model_params_obj and isinstance(model_params_obj['params'], dict):
+            nested = model_params_obj['params']
+            # Check if nested dict has 'policy' key (PPO structure)
+            if 'policy' in nested:
+                # Already has PPO structure
+                model_params = nested
+            else:
+                # Raw network layers - wrap in PPO structure
+                # The 'params' dict contains the actual network layers (hidden_0, hidden_1, etc.)
+                model_params = {'policy': {'params': nested}}
+        elif 'policy' in model_params_obj:
+            # Already has 'policy' key at top level
+            model_params = model_params_obj
         else:
-            if not hasattr(model_params_obj, 'policy'):
-                raise TypeError(
-                    f"model_params_obj must be a dict or have 'policy' attribute, "
-                    f"got {type(model_params_obj)}"
-                )
-            model_params: dict = model_params_obj.policy.get('params')
-            if model_params is None:
-                raise KeyError("model_params_obj.policy.get('params') returned None")
-    except AttributeError as e:
-        raise TypeError(f"Failed to extract model parameters: {e}") from e
+            # No 'params' or 'policy' key - assume it's the policy params directly
+            # Wrap in PPO structure
+            model_params = {'policy': {'params': model_params_obj}}
+    else:
+        raise TypeError(
+            f"model_params_obj must be a dict, got {type(model_params_obj)}"
+        )
     
+    # Validate structure
     if not isinstance(model_params, dict):
         raise TypeError(f"Model parameters must be a dictionary, got {type(model_params)}")
     
-    required_keys = ["policy", "value", "aux", "policy_aux", "value_aux", "aux_aux"]
-    missing_keys = [key for key in required_keys if key not in model_params]
-    if missing_keys:
-        raise KeyError(f"Model parameters missing required keys: {missing_keys}")
+    if 'policy' not in model_params:
+        raise KeyError(f"Model parameters must contain 'policy' key, got keys: {list(model_params.keys())}")
     
     return model_params
 
@@ -333,40 +449,24 @@ def verify_policy_network_signature(policy_network) -> None:
     Raises:
     ------
     AttributeError
-        If policy_network doesn't have an 'apply' method or signature
-    KeyError
-        If required parameters are missing from the signature
-    
-    Expected parameters:
-    - params: model parameters
-    - obs: observations
-    - deterministic: whether to use deterministic action
-    - rng: random number generator
-    - step_type: step type
-    - episode_length: episode length
-    - episode_return: episode return
+        If policy_network doesn't have an 'apply' method
     
     Note:
     -----
-    This verification ensures the network signature matches expectations, but the
-    actual apply call may need to handle optional/default parameters.
+    This is a lenient check - we only verify the apply method exists.
+    The actual signature may vary and we handle it in the inference function.
     """
     if not hasattr(policy_network, 'apply'):
         raise AttributeError("policy_network must have an 'apply' method")
     
-    if not hasattr(policy_network.apply, 'signature'):
-        raise AttributeError("policy_network.apply must have a 'signature' attribute")
-    
-    # Access signature.parameters safely after verifying signature exists
-    signature_params = policy_network.apply.signature.parameters
-    required_params = ['params', 'obs', 'deterministic', 'rng', 'step_type', 'episode_length', 'episode_return']
-    
-    missing_params = [param for param in required_params if param not in signature_params]
-    if missing_params:
-        raise KeyError(
-            f"Policy network apply signature missing required parameters: {missing_params}. "
-            f"Found parameters: {list(signature_params.keys())}"
-        )
+    # Optional: Try to inspect signature if available, but don't fail if not
+    if hasattr(policy_network.apply, 'signature'):
+        try:
+            signature_params = policy_network.apply.signature.parameters
+            # Just log for debugging, don't enforce strict requirements
+            print(f"DEBUG: Policy network apply signature has parameters: {list(signature_params.keys())[:5]}...")
+        except Exception:
+            pass  # Signature inspection failed, but that's okay
 
 
 def make_jax_inference_fn(params, act_size, ppo_params, obs_size) -> Callable:
@@ -396,8 +496,14 @@ def make_jax_inference_fn(params, act_size, ppo_params, obs_size) -> Callable:
     Callable
         JAX inference function that takes obs and returns actions
     """
-    if len(params) != 2:
-        raise ValueError(f"params must be a tuple of length 2, got {len(params)}")
+    # Handle both 2-element and 3-element params tuples/lists
+    # Brax checkpoints can have: (norm_params, policy_params, value_params)
+    # We only need the first 2 elements (norm_params and policy_params)
+    if len(params) < 2:
+        raise ValueError(f"params must have at least 2 elements, got {len(params)}")
+    if len(params) > 2:
+        # Extract first 2 elements (discard value network params if present)
+        params = params[:2]
 
     # Extract normalization parameters
     mean, std = extract_norm_params(params)
@@ -418,21 +524,53 @@ def make_jax_inference_fn(params, act_size, ppo_params, obs_size) -> Callable:
     # Verify signature can be determined, then get correct argument order
     verify_network_factory_signature(network_factory, obs_size, act_size)
     arg1, arg2 = get_network_factory_argument_order(network_factory, obs_size, act_size)
-    policy_network, _ = network_factory(arg1, arg2)
+    networks = network_factory(arg1, arg2)
+    # PPONetworks is an object with policy_network and value_network attributes
+    policy_network = networks.policy_network
 
     # Verify the argument order of the policy network apply function
     verify_policy_network_signature(policy_network)
     
-    # Extract policy parameters from model_params (similar to TensorFlow version)
+    # Extract policy parameters from model_params
+    # model_params structure from extract_model_params: {'policy': {'params': {...}}}
+    # where {...} contains the actual network layers (hidden_0, hidden_1, etc.)
     policy_params = model_params.get('policy')
     if policy_params is None:
         raise KeyError("model_params must contain 'policy' key with policy network parameters")
+    
+    # Brax policy network apply signature is: (processor_params, policy_params, obs)
+    # processor_params: normalization/preprocessing params (empty since we normalize manually)
+    # policy_params: the actual network parameters dict with layers (hidden_0, hidden_1, etc.)
+    if isinstance(policy_params, dict):
+        processor_params = policy_params.get('processor', {})
+        if 'params' in policy_params:
+            # Extract the actual network parameters (dict with hidden_0, hidden_1, etc.)
+            actual_policy_params = policy_params['params']
+        else:
+            # If no 'params' key, the whole dict might be the policy params directly
+            actual_policy_params = policy_params
+    else:
+        processor_params = {}
+        actual_policy_params = policy_params
+    
+    # Validate that actual_policy_params has the expected structure (dict with layer names)
+    if not isinstance(actual_policy_params, dict):
+        raise TypeError(
+            f"Policy parameters must be a dict with layer names, got {type(actual_policy_params)}"
+        )
+    if len(actual_policy_params) == 0:
+        raise ValueError("Policy parameters dict is empty")
 
     # Create inference function with normalization and output processing
-    # For inference, we provide:
-    # - params, obs (required positional args)
-    # - deterministic=True (for deterministic inference)
-    # - Other params (rng, step_type, etc.) use their defaults if they have them
+    # Brax policy network apply signature: (processor_params, policy_params, obs)
+    # We do normalization manually, so processor_params can be empty
+    # Ensure mean/std are float32 to match input dtype (even when x64 is enabled)
+    mean_f32 = jnp.asarray(mean, dtype=jnp.float32)
+    std_f32 = jnp.asarray(std, dtype=jnp.float32)
+    
+    # Convert act_size to concrete int to avoid tracing issues with jax2onnx
+    act_size_concrete = int(act_size)
+    
     def jax_inference_fn(obs):
         """
         JAX inference function that:
@@ -441,19 +579,23 @@ def make_jax_inference_fn(params, act_size, ppo_params, obs_size) -> Callable:
         3. Splits output and applies tanh: tanh(split(logits)[0])
         """
         # Normalize observations (matching TensorFlow version)
-        normalized_obs = (obs - mean) / std
+        # Use float32 mean/std to match input dtype
+        normalized_obs = (obs - mean_f32) / std_f32
         
-        # Call apply with required params and deterministic=True
-        # Other parameters (rng, step_type, episode_length, episode_return) 
-        # will use their default values from the signature
+        # Call apply with correct signature: (processor_params, policy_params, obs)
+        # Flax networks expect parameters wrapped in {'params': {...}} structure
+        # processor_params: empty dict since we normalize manually
+        # policy_params: must be wrapped as {'params': actual_policy_params} for Flax
         logits = policy_network.apply(
-            policy_params,
-            normalized_obs,
-            deterministic=True
+            processor_params,
+            {'params': actual_policy_params},
+            normalized_obs
         )
         
         # Split logits into loc (mean action, location parameter) and log_std (discarded)
-        loc, _ = jnp.split(logits, 2, axis=-1)
+        # Use concrete act_size to avoid dynamic shape issues during jax2onnx tracing
+        # The logits shape should be (batch, act_size * 2), so we split at act_size
+        loc = logits[..., :act_size_concrete]
         return jnp.tanh(loc)
         
     return jax_inference_fn

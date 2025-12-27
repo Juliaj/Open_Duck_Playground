@@ -133,6 +133,7 @@ The `--index-strategy unsafe-best-match` flag allows uv to check all indexes (Py
 To add a new package that requires the nightly index:
 
 ```bash
+uv lock --upgrade-package warp-lang --extra-index-url https://download.pytorch.org/whl/nightly/cu128 --index-strategy unsafe-best-match
 uv lock --upgrade-package <package_name> --extra-index-url https://download.pytorch.org/whl/nightly/cu128 --index-strategy unsafe-best-match
 uv sync
 ```

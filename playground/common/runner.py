@@ -12,6 +12,8 @@ from flax.training import orbax_utils
 from tensorboardX import SummaryWriter
 
 import os
+import warnings
+import traceback
 from brax.training.agents.ppo import networks as ppo_networks, train as ppo
 from mujoco_playground import wrapper
 from mujoco_playground.config import locomotion_params
@@ -54,6 +56,39 @@ class BaseRunner(ABC):
             "xla_gpu_per_fusion_autotune_cache_dir",
         )
         os.environ["JAX_COMPILATION_CACHE_DIR"] = ".tmp/jax_cache"
+        
+        # Set up warning filter to capture JAX overflow warnings with context
+        # self._setup_jax_overflow_debugging()
+
+    def _setup_jax_overflow_debugging(self) -> None:
+        """Set up debugging for JAX overflow warnings."""
+        def jax_overflow_warning_handler(message, category, filename, lineno, file=None, line=None):
+            """Custom handler for JAX overflow warnings."""
+            if "overflow encountered in cast" in str(message):
+                # Get stack trace to see where the warning originated
+                stack = traceback.extract_stack()
+                # Find the relevant frame (skip internal JAX frames)
+                relevant_frames = []
+                for frame in reversed(stack[:-5]):  # Skip the warning handler frames
+                    if 'jax' not in frame.filename.lower() or 'abstract_arrays' in frame.filename:
+                        continue
+                    relevant_frames.append(f"  {frame.filename}:{frame.lineno} in {frame.name}")
+                    if len(relevant_frames) >= 3:  # Show top 3 relevant frames
+                        break
+                
+                print(f"DEBUG JAX Overflow Warning:")
+                print(f"  Message: {message}")
+                print(f"  Location: {filename}:{lineno}")
+                if relevant_frames:
+                    print(f"  Call stack (relevant frames):")
+                    print("\n".join(relevant_frames))
+                print()
+            
+            # Still show the original warning
+            return warnings.formatwarning(message, category, filename, lineno, line)
+        
+        # Install custom warning handler
+        warnings.showwarning = jax_overflow_warning_handler
 
     def progress_callback(self, num_steps: int, metrics: dict) -> None:
 
@@ -71,11 +106,25 @@ class BaseRunner(ABC):
         """Export policy to ONNX format.
         
         Args:
-            params: Policy parameters containing normalization stats and model weights.
+            params: Policy parameters from Brax training. May be a tuple of length 2 or 3.
+                   For JAX export, extracts first 2 elements: (normalization_params, model_params).
+                   For TensorFlow export, passes params as-is (it accesses params[0] and params[1]).
             output_path: Path to save the ONNX model file.
         """
         if self.use_jax_to_onnx:
             print("Using JAX-to-ONNX direct export")
+            # JAX export requires exactly 2 elements: (normalization_params, model_params)
+            # Brax may pass 3 elements (e.g., including optimizer state), so extract first 2
+            if not isinstance(params, tuple):
+                raise TypeError(f"params must be a tuple, got {type(params)}")
+            
+            if len(params) < 2:
+                raise ValueError(f"params tuple must have at least 2 elements, got {len(params)}")
+            
+            if len(params) > 2:
+                print(f"DEBUG: params tuple has {len(params)} elements, extracting first 2 (discarding element(s) {list(range(2, len(params)))})")
+                params = params[:2]
+            
             export_onnx_jax(
                 params,
                 self.action_size,
@@ -85,6 +134,7 @@ class BaseRunner(ABC):
             )
         else:
             print("Using TensorFlow-based ONNX export")
+            # TensorFlow export accesses params[0] and params[1] directly, so pass as-is
             export_onnx(
                 params,
                 self.action_size,
