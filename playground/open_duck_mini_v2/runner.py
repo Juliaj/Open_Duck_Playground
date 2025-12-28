@@ -4,7 +4,7 @@ import argparse
 
 from playground.common import randomize
 from playground.common.runner import BaseRunner
-from playground.open_duck_mini_v2 import joystick, standing
+from playground.open_duck_mini_v2 import joystick, standing, ros2_replay
 
 
 class OpenDuckMiniV2Runner(BaseRunner):
@@ -14,6 +14,7 @@ class OpenDuckMiniV2Runner(BaseRunner):
         available_envs = {
             "joystick": (joystick, joystick.Joystick),
             "standing": (standing, standing.Standing),
+            "ros2_replay": (ros2_replay, ros2_replay.ROS2Replay),
         }
         if args.env not in available_envs:
             raise ValueError(f"Unknown env {args.env}")
@@ -21,8 +22,14 @@ class OpenDuckMiniV2Runner(BaseRunner):
         self.env_file = available_envs[args.env]
 
         self.env_config = self.env_file[0].default_config()
-        self.env = self.env_file[1](task=args.task)
-        self.eval_env = self.env_file[1](task=args.task)
+        # For ros2_replay, pass data_path if provided
+        if args.env == "ros2_replay" and hasattr(args, "data_path"):
+            config_overrides = {"data_path": args.data_path}
+            self.env = self.env_file[1](task=args.task, config_overrides=config_overrides)
+            self.eval_env = self.env_file[1](task=args.task, config_overrides=config_overrides)
+        else:
+            self.env = self.env_file[1](task=args.task)
+            self.eval_env = self.env_file[1](task=args.task)
         self.randomizer = randomize.domain_randomize
         self.action_size = self.env.action_size
         self.obs_size = int(
@@ -54,6 +61,12 @@ def main() -> None:
         "--use_jax_to_onnx",
         action="store_true",
         help="Use JAX-to-ONNX direct export (avoids TensorFlow, better for RTX 5090)",
+    )
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="mujoco_manual_data.h5",
+        help="Path to HDF5 data file for ros2_replay environment",
     )
     # parser.add_argument(
     #     "--debug", action="store_true", help="Run in debug mode with minimal parameters"
