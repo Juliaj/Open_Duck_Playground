@@ -18,14 +18,26 @@ Validate ONNX model in MuJoCo simulation.
 Tests if the model can walk forward without falling.
 
 Usage:
-    uv run python tests/validate_onnx_simulation.py --onnx checkpoints/model.onnx
+  
+    uv run python tests/validate_onnx_simulation.py --onnx checkpoints/2025_12_26_165635_300482560.onnx --viewer --fall-duration-steps 15000
     uv run python tests/validate_onnx_simulation.py --checkpoints-dir checkpoints
+
+    # headless mode
+    uv run python tests/validate_onnx_simulation.py \
+    --onnx checkpoints/2025_12_26_165635_300482560.onnx \
+    --auto-start \
+    --log-contacts /tmp/contacts_expected.npz \
+    --log-contacts-decimation 1 \
+    --debounce-on-steps 3 --debounce-off-steps 3 \
+    --fall-duration-steps 15000
 """
 
 import argparse
 import json
 import os
+import sys
 import time
+from typing import Optional
 import numpy as np
 import mujoco
 import mujoco.viewer
@@ -35,6 +47,53 @@ from playground.common.onnx_infer import OnnxInfer
 from playground.common.poly_reference_motion_numpy import PolyReferenceMotion
 from playground.open_duck_mini_v2 import base
 from playground.open_duck_mini_v2.mujoco_infer_base import MJInferBase
+
+
+def wait_for_o_key():
+    """Wait for 'o' key press before starting walk."""
+    print("Press 'o' and Enter to start walking...")
+    while True:
+        try:
+            user_input = input().strip().lower()
+            if user_input == 'o':
+                print("Starting walk...")
+                break
+            else:
+                print("Press 'o' and Enter to start walking...")
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting...")
+            sys.exit(0)
+
+
+def apply_debounce(raw: np.ndarray, debounce_on_steps: int, debounce_off_steps: int) -> np.ndarray:
+    """Apply a simple debounce/hysteresis filter to a boolean contact signal.
+
+    Semantics match mujoco_ros2_control gait consumer:
+    - switch ON after debounce_on_steps consecutive raw True
+    - switch OFF after debounce_off_steps consecutive raw False
+    """
+    debounce_on_steps = max(1, int(debounce_on_steps))
+    debounce_off_steps = max(1, int(debounce_off_steps))
+
+    filtered = np.zeros_like(raw, dtype=bool)
+    state = False
+    on_counter = 0
+    off_counter = 0
+
+    for i, r in enumerate(raw.astype(bool)):
+        if r:
+            on_counter += 1
+            off_counter = 0
+            if not state and on_counter >= debounce_on_steps:
+                state = True
+        else:
+            off_counter += 1
+            on_counter = 0
+            if state and off_counter >= debounce_off_steps:
+                state = False
+        filtered[i] = state
+
+    return filtered
 
 
 class ForwardWalkCommand:
@@ -49,6 +108,12 @@ class ForwardWalkCommand:
             Forward velocity (default: 0.15, max forward)
         """
         self.linear_vel_x = linear_vel_x
+        self.start_walking = False
+        self.auto_start = False
+    
+    def set_start_walking(self, value=True):
+        """Set flag to start walking."""
+        self.start_walking = value
     
     def get_command(self, step):
         """Get command for current step.
@@ -63,7 +128,10 @@ class ForwardWalkCommand:
         list
             Command vector [lin_vel_x, lin_vel_y, ang_vel, neck_pitch, head_pitch, head_yaw, head_roll]
         """
-        return [self.linear_vel_x, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        if self.start_walking:
+            return [self.linear_vel_x, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        else:
+            return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 class HeadlessSimulation(MJInferBase):
@@ -193,6 +261,9 @@ class HeadlessSimulation(MJInferBase):
         total_steps_below_threshold = 0
         fall_detected = False
         fall_step = None
+
+        # Optional contact logging (raw expected from MuJoCo)
+        contact_log = getattr(self, "_contact_log", None)
         
         if use_viewer:
             with mujoco.viewer.launch_passive(
@@ -201,11 +272,24 @@ class HeadlessSimulation(MJInferBase):
                 show_left_ui=False,
                 show_right_ui=False,
             ) as viewer:
+                # Wait for 'o' key before starting walk
+                if not getattr(command_sequence, "auto_start", False):
+                    wait_for_o_key()
+                command_sequence.set_start_walking(True)
+                
                 while step < max_steps:
                     step_start = time.time()
                     mujoco.mj_step(self.model, self.data)
                     step += 1
                     counter += 1
+
+                    if contact_log is not None and (step % contact_log["decimation"] == 0):
+                        left_c, right_c = self.get_feet_contacts(self.data)
+                        contact_log["step"].append(step)
+                        contact_log["time"].append(float(self.data.time))
+                        contact_log["ncon"].append(int(self.data.ncon))
+                        contact_log["left_contact_raw"].append(bool(left_c))
+                        contact_log["right_contact_raw"].append(bool(right_c))
                     
                     if counter % self.decimation == 0:
                         command = command_sequence.get_command(step)
@@ -247,10 +331,23 @@ class HeadlessSimulation(MJInferBase):
                     if time_until_next_step > 0:
                         time.sleep(time_until_next_step)
         else:
+            # Wait for 'o' key before starting walk
+            if not getattr(command_sequence, "auto_start", False):
+                wait_for_o_key()
+            command_sequence.set_start_walking(True)
+            
             while step < max_steps:
                 mujoco.mj_step(self.model, self.data)
                 step += 1
                 counter += 1
+
+                if contact_log is not None and (step % contact_log["decimation"] == 0):
+                    left_c, right_c = self.get_feet_contacts(self.data)
+                    contact_log["step"].append(step)
+                    contact_log["time"].append(float(self.data.time))
+                    contact_log["ncon"].append(int(self.data.ncon))
+                    contact_log["left_contact_raw"].append(bool(left_c))
+                    contact_log["right_contact_raw"].append(bool(right_c))
                 
                 if counter % self.decimation == 0:
                     command = command_sequence.get_command(step)
@@ -294,8 +391,8 @@ class HeadlessSimulation(MJInferBase):
         
         # Determine pass/fail
         passed = not fall_detected and forward_distance > 0.1
-        
-        return {
+
+        result = {
             "status": "PASS" if passed else "FAIL",
             "fall_detected": fall_detected,
             "fall_step": fall_step,
@@ -308,8 +405,62 @@ class HeadlessSimulation(MJInferBase):
             "fraction_below_threshold": float(fraction_below_threshold),
         }
 
+        if contact_log is not None:
+            # Convert to numpy arrays for serialization
+            result["contact_log"] = {
+                "step": np.asarray(contact_log["step"], dtype=np.int32),
+                "time": np.asarray(contact_log["time"], dtype=np.float64),
+                "ncon": np.asarray(contact_log["ncon"], dtype=np.int32),
+                "left_contact_raw_expected": np.asarray(contact_log["left_contact_raw"], dtype=np.bool_),
+                "right_contact_raw_expected": np.asarray(contact_log["right_contact_raw"], dtype=np.bool_),
+            }
+            if contact_log.get("debounce_on_steps") is not None:
+                on_s = int(contact_log["debounce_on_steps"])
+                off_s = int(contact_log["debounce_off_steps"])
+                result["contact_log"]["debounce_on_steps"] = on_s
+                result["contact_log"]["debounce_off_steps"] = off_s
+                result["contact_log"]["left_contact_expected"] = apply_debounce(
+                    result["contact_log"]["left_contact_raw_expected"], on_s, off_s
+                )
+                result["contact_log"]["right_contact_expected"] = apply_debounce(
+                    result["contact_log"]["right_contact_raw_expected"], on_s, off_s
+                )
 
-def validate_single_model(onnx_path, duration_seconds=120, use_viewer=False, fall_height_threshold=0.3, fall_duration_steps=500):
+        return result
+
+    def enable_contact_logging(
+        self,
+        decimation: int = 1,
+        debounce_on_steps: Optional[int] = None,
+        debounce_off_steps: Optional[int] = None,
+    ) -> dict:
+        """Enable per-step contact logging on this simulation instance."""
+        contact_log = {
+            "decimation": max(1, int(decimation)),
+            "step": [],
+            "time": [],
+            "ncon": [],
+            "left_contact_raw": [],
+            "right_contact_raw": [],
+            "debounce_on_steps": debounce_on_steps,
+            "debounce_off_steps": debounce_off_steps,
+        }
+        # stash on self for use in run_headless
+        self._contact_log = contact_log
+        return contact_log
+
+
+def validate_single_model(
+    onnx_path,
+    duration_seconds=120,
+    use_viewer=False,
+    fall_height_threshold=0.3,
+    fall_duration_steps=500,
+    auto_start=False,
+    log_contacts_decimation=1,
+    debounce_on_steps=0,
+    debounce_off_steps=0,
+):
     """Validate a single ONNX model in simulation.
     
     Parameters:
@@ -354,6 +505,18 @@ def validate_single_model(onnx_path, duration_seconds=120, use_viewer=False, fal
         
         # Create forward walk command
         command_seq = ForwardWalkCommand(linear_vel_x=0.15)
+        command_seq.auto_start = bool(auto_start)
+
+        # Optional: enable contact logging (expected from MuJoCo)
+        if log_contacts_decimation and int(log_contacts_decimation) > 0:
+            if int(debounce_on_steps) > 0 and int(debounce_off_steps) > 0:
+                sim.enable_contact_logging(
+                    decimation=int(log_contacts_decimation),
+                    debounce_on_steps=int(debounce_on_steps),
+                    debounce_off_steps=int(debounce_off_steps),
+                )
+            else:
+                sim.enable_contact_logging(decimation=int(log_contacts_decimation))
         
         # Run simulation
         result = sim.run_headless(
@@ -413,6 +576,37 @@ def main():
         default=500,
         help="Number of consecutive steps below threshold to consider fallen (default: 500)"
     )
+
+    parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        help="Skip interactive wait and start walking immediately (useful for non-interactive logging).",
+    )
+
+    parser.add_argument(
+        "--log-contacts",
+        type=str,
+        default="",
+        help="If set, write MuJoCo expected contact logs to this .npz file (raw + optional debounced).",
+    )
+    parser.add_argument(
+        "--log-contacts-decimation",
+        type=int,
+        default=1,
+        help="Log contacts every N sim steps (default: 1 = every sim step).",
+    )
+    parser.add_argument(
+        "--debounce-on-steps",
+        type=int,
+        default=0,
+        help="If >0, compute debounced expected contact with this debounce-on (steps).",
+    )
+    parser.add_argument(
+        "--debounce-off-steps",
+        type=int,
+        default=0,
+        help="If >0, compute debounced expected contact with this debounce-off (steps).",
+    )
     
     args = parser.parse_args()
     
@@ -449,11 +643,15 @@ def main():
     for onnx_path in sorted(onnx_files):
         print(f"Testing {os.path.basename(onnx_path)}...")
         result = validate_single_model(
-            onnx_path, 
+            onnx_path,
             args.duration,
             use_viewer=args.viewer,
             fall_height_threshold=args.fall_height_threshold,
-            fall_duration_steps=args.fall_duration_steps
+            fall_duration_steps=args.fall_duration_steps,
+            auto_start=args.auto_start,
+            log_contacts_decimation=args.log_contacts_decimation if args.log_contacts else 0,
+            debounce_on_steps=args.debounce_on_steps,
+            debounce_off_steps=args.debounce_off_steps,
         )
         results.append(result)
         
@@ -473,6 +671,32 @@ def main():
                 print(f"  Stability: {result['stability_score']:.2f}, Forward: {result['forward_distance']:.2f}m, Steps: {result['episode_length']}{fall_info}{fraction_info}")
         print()
     
+        # Save expected contact logs if requested.
+        if args.log_contacts:
+            log = result.get("contact_log", None)
+            if log is None:
+                print("Warning: --log-contacts requested but no contact_log was produced.")
+            else:
+                # If multiple models are evaluated, suffix the filename to avoid overwriting.
+                out_path = args.log_contacts
+                if len(onnx_files) > 1 and out_path.endswith(".npz"):
+                    base, ext = os.path.splitext(out_path)
+                    out_path = f"{base}.{os.path.basename(onnx_path)}{ext}"
+
+                np.savez_compressed(
+                    out_path,
+                    step=log["step"],
+                    time=log["time"],
+                    ncon=log["ncon"],
+                    left_contact_raw_expected=log["left_contact_raw_expected"].astype(np.uint8),
+                    right_contact_raw_expected=log["right_contact_raw_expected"].astype(np.uint8),
+                    left_contact_expected=log.get("left_contact_expected", np.empty(0, dtype=np.uint8)).astype(np.uint8),
+                    right_contact_expected=log.get("right_contact_expected", np.empty(0, dtype=np.uint8)).astype(np.uint8),
+                    debounce_on_steps=np.asarray([log.get("debounce_on_steps", 0) or 0], dtype=np.int32),
+                    debounce_off_steps=np.asarray([log.get("debounce_off_steps", 0) or 0], dtype=np.int32),
+                )
+                print(f"Wrote contact log to: {out_path}")
+
     # Summary
     passed = sum(1 for r in results if r["status"] == "PASS")
     failed = len(results) - passed
