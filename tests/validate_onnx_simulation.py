@@ -194,6 +194,7 @@ class HeadlessSimulation(MJInferBase):
         """
         gyro = self.get_gyro(data)
         accelerometer = self.get_accelerometer(data)
+        # this is acutally not used, https://github.com/apirrone/Open_Duck_Playground/pull/24
         accelerometer[0] += 1.3
         
         joint_angles = self.get_actuator_joints_qpos(data.qpos)
